@@ -40,7 +40,7 @@ NEW_BADGE = re.compile(r"^\s*new\s*$", re.I)
 GENERIC_REWARD_LABELS = {"item"}  # placeholder label fut.gg shows for some rewards
 
 # Title line shown above the objective cards - edit the text/emojis however you like
-HEADER = "# 🎯🆕 **NEW OBJECTIVES ALERT** 🆕🎯\n-# Hover Bot brought to you by SKELETOR"
+HEADER = "# 🎯🆕 **NEW OBJECTIVES ALERT** 🆕🎯\n-# 
 
 # Message posted at the very bottom, after all the objective cards.
 # Edit the text/emojis/link however you like, or set it to "" for no footer.
@@ -48,7 +48,7 @@ FOOTER = ""
 
 # Role to ping in the footer (pings once per post). Paste the role's ID - numbers
 # only, e.g. "123456789012345678" - or leave as "" for no ping.
-PING_ROLE_ID = "1551540516238131270"
+PING_ROLE_ID = "1551541765327167599"
 
 
 def get(url):
