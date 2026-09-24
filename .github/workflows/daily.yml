@@ -1,0 +1,64 @@
+name: New Objective alerts
+
+on:
+  schedule:
+    # GitHub cron is UTC. 6pm UK is 17:00 UTC in summer (BST) and 18:00 UTC in
+    # winter (GMT), so both are listed and the "gate" step below lets through
+    # only the run that lands at 6pm UK time.
+    - cron: "0 17 * * *"
+    - cron: "0 18 * * *"
+  workflow_dispatch:       # lets you run it manually from the Actions tab
+    inputs:
+      test:
+        # Ticked = post every objective currently labelled New to Discord, even if it
+        # was posted before. Unticked = normal run (only posts new ones).
+        description: "Test"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write          # needed to save posted.json back to the repo
+
+concurrency:
+  group: objective-alerts
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate - only continue at 6pm UK (manual runs always continue)
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Europe/London date +%H)" != "18" ]; then
+            echo "Not 6pm in the UK - skipping"
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.go == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.go == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+        if: steps.gate.outputs.go == 'true'
+
+      - run: python bot.py
+        if: steps.gate.outputs.go == 'true'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TEST_MODE: ${{ inputs.test && '1' || '' }}
+
+      - name: Save posted list
+        if: steps.gate.outputs.go == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add posted.json || true
+          git diff --staged --quiet || (git commit -m "Update posted objectives" && git push)
