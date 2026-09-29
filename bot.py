@@ -1,14 +1,15 @@
-"""Posts new objectives from fut.gg/objectives to a Discord channel via webhook.
+"""Posts objectives labelled "New" on fut.gg/objectives to a Discord channel via webhook.
 
-Any objective link not yet in posted.json counts as new. The very first run (no
-posted.json yet) just records everything currently listed WITHOUT posting, so
-only objectives added after that get posted.
+An objective is posted when it shows the "New" label now but did not show it at
+the previous run. So an objective that keeps its label for several days is posted
+once, and one that comes back with the label again (e.g. a weekly one) is posted
+again. posted.json only remembers which objectives were labelled New last time.
 
 Env vars (same names as the SBC bot, so the same workflow file works):
   DISCORD_WEBHOOK_URL  webhook to post to (GitHub secret)
   PING_ROLE_ID         optional role ID to ping after the post (GitHub secret)
   DRY_RUN=1            print what would be posted instead of sending it
-  TEST_MODE=1          post the first few objectives on the page, even if already posted
+  TEST_MODE=1          post the first few objectives on the page, ignoring the label
   TEST_URL=<link>      post just this one objective page, skipping the site scan
 """
 import json
@@ -44,6 +45,11 @@ HEADERS = {
 OBJ_HREF = re.compile(
     r"^(?:https://www\.fut\.gg)?/objectives/[a-z0-9-]+/\d+-[^/]+/?$"
 )
+# The "New" label must be exactly "New" (so "Newcastle Special" won't match). It
+# can be its own text piece ("New") or stuck onto the end of the title ("PointsNew").
+NEW_BADGE = re.compile(r"^\s*new\s*$", re.I)
+NEW_SUFFIX = re.compile(r"[a-z0-9)!?.]New$")
+
 # In test mode, how many objectives from the top of the page to post
 TEST_LIMIT = 3
 
@@ -370,14 +376,42 @@ def to_embed(obj):
     return embed
 
 
+def has_new_label(anchor):
+    if anchor.find(string=NEW_BADGE):
+        return True
+    return bool(NEW_SUFFIX.search(anchor.get_text("", strip=True)))
+
+
 def find_objective_links(html):
-    """Every objective link on the listing page, in page order."""
+    """Every objective on the listing page, in page order, as
+    {url: True/False} where True means it carries the "New" label."""
     soup = BeautifulSoup(html, "html.parser")
-    urls = list(dict.fromkeys(urljoin(BASE, a["href"]) for a in soup.find_all("a", href=OBJ_HREF)))
-    if not urls:
+    found = {}
+    for a in soup.find_all("a", href=OBJ_HREF):
+        url = urljoin(BASE, a["href"])
+        found[url] = found.get(url, False) or has_new_label(a)
+    if not found:
         sys.exit("No objective cards found - the page layout may have changed.")
-    print(f"Found {len(urls)} objectives on the page")
-    return urls
+    print(f"Found {len(found)} objectives on the page, {sum(found.values())} labelled New")
+    return found
+
+
+def load_state():
+    """URLs that were labelled New at the previous run, or None on a first run
+    (also None for the old posted-list format, so it starts fresh)."""
+    if not STATE_FILE.exists():
+        return None
+    try:
+        data = json.loads(STATE_FILE.read_text())
+    except ValueError:
+        return None
+    if isinstance(data, dict) and isinstance(data.get("new"), list):
+        return set(data["new"])
+    return None
+
+
+def save_state(new_urls):
+    STATE_FILE.write_text(json.dumps({"new": sorted(new_urls)}, indent=2))
 
 
 def load_objective(url):
@@ -422,35 +456,30 @@ def main():
             post([embed])
         return
 
-    urls = find_objective_links(get(LIST_URL))
+    found = find_objective_links(get(LIST_URL))
+    labelled = {u for u, is_new in found.items() if is_new}
 
     if TEST_MODE:
-        urls = urls[:TEST_LIMIT]
-        print(f"Test mode - posting the first {len(urls)} objectives")
-        posted = set()
-    elif not STATE_FILE.exists():
-        # First ever run: remember what's already there, post nothing.
-        print(f"First run - recording {len(urls)} existing objectives without posting")
-        if not DRY_RUN:
-            STATE_FILE.write_text(json.dumps(sorted(urls), indent=2))
-        return
+        new_urls = list(found)[:TEST_LIMIT]
+        print(f"Test mode - posting the first {len(new_urls)} objectives")
     else:
-        posted = set(json.loads(STATE_FILE.read_text()))
+        previous = load_state()
+        if previous is None:
+            print("First run - posting everything currently labelled New")
+            previous = set()
+        new_urls = [u for u in found if u in labelled and u not in previous]
+    print(f"{len(new_urls)} objective(s) to post")
 
-    new_urls = [u for u in urls if u not in posted]
-    print(f"{len(new_urls)} new objective(s) to post")
     new = [o for o in map(load_objective, new_urls) if o]
-    if not new:
-        return
+    if new:
+        embeds = [to_embed(o) for o in new]
+        if DRY_RUN:
+            print(json.dumps(embeds, indent=2, ensure_ascii=False))
+        else:
+            post(embeds)
 
-    embeds = [to_embed(o) for o in new]
-    if DRY_RUN:
-        print(json.dumps(embeds, indent=2, ensure_ascii=False))
-        return
-
-    post(embeds)
-    if not TEST_MODE:
-        STATE_FILE.write_text(json.dumps(sorted(posted | {o["url"] for o in new}), indent=2))
+    if not TEST_MODE and not DRY_RUN:
+        save_state(labelled)  # only reached if posting didn't fail
 
 
 if __name__ == "__main__":
