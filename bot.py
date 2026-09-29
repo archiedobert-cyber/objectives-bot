@@ -9,7 +9,7 @@ Env vars (same names as the SBC bot, so the same workflow file works):
   DISCORD_WEBHOOK_URL  webhook to post to (GitHub secret)
   PING_ROLE_ID         optional role ID to ping after the post (GitHub secret)
   DRY_RUN=1            print what would be posted instead of sending it
-  TEST_MODE=1          post the first few objectives on the page, ignoring the label
+  TEST_MODE=1          post the objectives currently labelled New (or the first few on the page if none), even if already posted
   TEST_URL=<link>      post just this one objective page, skipping the site scan
 """
 import json
@@ -498,8 +498,9 @@ def main():
 
     if TEST_MODE:
         found = find_objective_links(get(LIST_URL))
-        new_urls = list(found)[:TEST_LIMIT]
-        print(f"Test mode - posting the first {len(new_urls)} objectives")
+        # Prefer objectives labelled New; if none are, use the first few on the page
+        new_urls = [u for u, i in found.items() if i["new"]][:TEST_LIMIT] or list(found)[:TEST_LIMIT]
+        print(f"Test mode - posting {len(new_urls)} objective(s), ignoring what was posted before")
         new = [o for o in (load_objective(u, found[u]["expires"]) for u in new_urls) if o]
         embeds = [to_embed(o) for o in new]
         if DRY_RUN:
