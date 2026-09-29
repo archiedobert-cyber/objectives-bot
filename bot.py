@@ -50,6 +50,11 @@ OBJ_HREF = re.compile(
 NEW_BADGE = re.compile(r"^\s*new\s*$", re.I)
 NEW_SUFFIX = re.compile(r"[a-z0-9)!?.]New$")
 
+# How long to keep re-checking the site for new content (scheduled runs set
+# POLL_MINUTES; 0 = check once), and how many seconds between checks.
+POLL_MINUTES = float(os.environ.get("POLL_MINUTES") or 0)
+POLL_EVERY = 20
+
 # In test mode, how many objectives from the top of the page to post
 TEST_LIMIT = 3
 
@@ -491,21 +496,38 @@ def main():
             post([embed])
         return
 
-    found = find_objective_links(get(LIST_URL))
-    labelled = {u for u, i in found.items() if i["new"]}
-
     if TEST_MODE:
+        found = find_objective_links(get(LIST_URL))
         new_urls = list(found)[:TEST_LIMIT]
         print(f"Test mode - posting the first {len(new_urls)} objectives")
-    else:
-        previous = load_state()
-        if previous is None:
-            print("First run - posting everything currently labelled New")
-            previous = set()
-        new_urls = [u for u in found if u in labelled and u not in previous]
-    print(f"{len(new_urls)} objective(s) to post")
+        new = [o for o in (load_objective(u, found[u]["expires"]) for u in new_urls) if o]
+        embeds = [to_embed(o) for o in new]
+        if DRY_RUN:
+            print(json.dumps(embeds, indent=2, ensure_ascii=False))
+        elif embeds:
+            post(embeds)
+        return
 
-    new = [o for o in (load_objective(u, found[u]["expires"]) for u in new_urls) if o]
+    previous = load_state()
+    if previous is None:
+        print("First run - posting everything currently labelled New")
+        previous = set()
+
+    # New content only appears on the site at release time, so keep checking
+    # for up to POLL_MINUTES and post the moment something new turns up.
+    deadline = time.time() + POLL_MINUTES * 60
+    while True:
+        found = find_objective_links(get(LIST_URL))
+        labelled = {u for u, i in found.items() if i["new"]}
+        new_urls = [u for u in found if u in labelled and u not in previous]
+        print(f"{len(new_urls)} objective(s) to post")
+
+        new = [o for o in (load_objective(u, found[u]["expires"]) for u in new_urls) if o]
+        if new or time.time() >= deadline:
+            break
+        print(f"Nothing new yet - checking again in {POLL_EVERY}s")
+        time.sleep(POLL_EVERY)
+
     if new:
         embeds = [to_embed(o) for o in new]
         if DRY_RUN:
@@ -513,7 +535,7 @@ def main():
         else:
             post(embeds)
 
-    if not TEST_MODE and not DRY_RUN:
+    if not DRY_RUN:
         save_state(labelled)  # only reached if posting didn't fail
 
 
