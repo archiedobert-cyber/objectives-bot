@@ -64,11 +64,11 @@ jobs:
           PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
           TEST_URL: ${{ inputs.test_url }}
-
+      
       - name: Save posted list
         if: steps.gate.outputs.go == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add posted.json || true
-          git diff --staged --quiet || (git commit -m "Update posted objectives" && git push)
+          git diff --staged --quiet || (git commit -m "Update posted objectives" && git pull --rebase && git push)
