@@ -4,17 +4,23 @@ on:
   schedule:
     # GitHub cron is UTC. 6pm UK is 17:00 UTC in summer (BST) and 18:00 UTC in
     # winter (GMT), so both are listed and the "gate" step below lets through
-    # only the run that lands at 6pm UK time.
-    - cron: "0 17 * * *"
-    - cron: "0 18 * * *"
+    # only the run that lands at 6pm UK time. Scheduled a few minutes past the
+    # hour, not on it - "on the hour" is GitHub's busiest queue slot and was
+    # the cause of the 10-15 minute delay.
+    - cron: "3 17 * * *"
+    - cron: "3 18 * * *"
   workflow_dispatch:       # lets you run it manually from the Actions tab
     inputs:
       test:
-        # Ticked = post every objective currently labelled New to Discord, even if it
-        # was posted before. Unticked = normal run (only posts new ones).
+        # Ticked = post every objective currently labelled New to Discord, even
+        # if it was posted before. Unticked = normal run (only posts new ones).
         description: "Test"
         type: boolean
         default: false
+      test_url:
+        description: "Test a specific objective: paste its fut.gg link (optional)"
+        type: string
+        default: ""
 
 permissions:
   contents: write          # needed to save posted.json back to the repo
@@ -27,11 +33,13 @@ jobs:
   post:
     runs-on: ubuntu-latest
     steps:
-      - name: Gate - only continue at 6pm UK (manual runs always continue)
+      - name: Gate - only continue in the 6pm UK hour (manual runs always continue)
         id: gate
         run: |
+          # Checks the hour only, not the minute: GitHub often starts scheduled
+          # runs several minutes late, and an exact-minute check would skip them.
           if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Europe/London date +%H)" != "18" ]; then
-            echo "Not 6pm in the UK - skipping"
+            echo "Not the 6pm UK hour - skipping"
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
@@ -53,7 +61,9 @@ jobs:
         if: steps.gate.outputs.go == 'true'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          PING_ROLE_ID: ${{ secrets.PING_ROLE_ID }}
           TEST_MODE: ${{ inputs.test && '1' || '' }}
+          TEST_URL: ${{ inputs.test_url }}
 
       - name: Save posted list
         if: steps.gate.outputs.go == 'true'
