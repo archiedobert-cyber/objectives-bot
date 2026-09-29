@@ -48,7 +48,7 @@ OBJ_HREF = re.compile(
 TEST_LIMIT = 3
 
 # Title line shown above the objective cards - edit the text/emojis however you like
-HEADER = "# 🚨🆕 **NEW OBJECTIVE** 🆕🚨"
+HEADER = "# 🚨 🆕 **NEW OBJECTIVE** 🆕 🚨"
 
 # Message posted at the very bottom, after all the cards. "" = no footer.
 FOOTER = ""
