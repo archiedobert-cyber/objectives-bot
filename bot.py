@@ -376,23 +376,56 @@ def to_embed(obj):
     return embed
 
 
-def has_new_label(anchor):
-    if anchor.find(string=NEW_BADGE):
-        return True
-    return bool(NEW_SUFFIX.search(anchor.get_text("", strip=True)))
+def card_container(anchor):
+    """Walk up from a link until the parent holds more than one objective (= the card)."""
+    node = anchor
+    while node.parent is not None and node.parent.name not in ("body", "html"):
+        hrefs = {a["href"] for a in node.parent.find_all("a", href=OBJ_HREF)}
+        if len(hrefs) > 1:
+            break
+        node = node.parent
+    return node
+
+
+EXPIRES_RE = re.compile(
+    r"expires?\s*in\s*(\d+\s*(?:days?|hours?|hrs?|minutes?|mins?|weeks?|months?)"
+    r"(?:\s*\d+\s*(?:hours?|hrs?|minutes?|mins?))?)",
+    re.I,
+)
+
+
+def card_info(anchor):
+    """Is the whole card labelled New (the badge can sit outside the link), and
+    what does the card say about expiry ("Expires in 7 days")?"""
+    card = card_container(anchor)
+    is_new = any(
+        NEW_BADGE.match(str(t))
+        for t in card.find_all(string=True)
+        if not t.find_parent(["script", "style"])
+    ) or any(NEW_SUFFIX.search(a.get_text("", strip=True)) for a in card.find_all("a"))
+    m = EXPIRES_RE.search(card.get_text(" ", strip=True))
+    return {"new": is_new, "expires": m.group(1).strip() if m else "", "text": card.get_text(" ", strip=True)}
 
 
 def find_objective_links(html):
     """Every objective on the listing page, in page order, as
-    {url: True/False} where True means it carries the "New" label."""
+    {url: {"new": bool, "expires": str}}."""
     soup = BeautifulSoup(html, "html.parser")
     found = {}
     for a in soup.find_all("a", href=OBJ_HREF):
         url = urljoin(BASE, a["href"])
-        found[url] = found.get(url, False) or has_new_label(a)
+        info = card_info(a)
+        old = found.get(url)
+        if old:
+            info["new"] = info["new"] or old["new"]
+            info["expires"] = info["expires"] or old["expires"]
+        found[url] = info
     if not found:
         sys.exit("No objective cards found - the page layout may have changed.")
-    print(f"Found {len(found)} objectives on the page, {sum(found.values())} labelled New")
+    new_count = sum(i["new"] for i in found.values())
+    print(f"Found {len(found)} objectives on the page, {new_count} labelled New")
+    for url, i in list(found.items())[:3]:
+        print(f"DEBUG card {url}: new={i['new']} text={i['text'][:150]!r}")
     return found
 
 
@@ -414,13 +447,15 @@ def save_state(new_urls):
     STATE_FILE.write_text(json.dumps({"new": sorted(new_urls)}, indent=2))
 
 
-def load_objective(url):
+def load_objective(url, expires_hint=""):
     try:
         page = BeautifulSoup(get(url), "html.parser")
     except requests.RequestException as e:
         print(f"Could not fetch objective page {url}: {e}")
         return None
-    return build_objective(url, page)
+    obj = build_objective(url, page)
+    obj["expires"] = obj["expires"] or expires_hint  # fall back to the card's "Expires in 7 days"
+    return obj
 
 
 def post(embeds):
@@ -457,7 +492,7 @@ def main():
         return
 
     found = find_objective_links(get(LIST_URL))
-    labelled = {u for u, is_new in found.items() if is_new}
+    labelled = {u for u, i in found.items() if i["new"]}
 
     if TEST_MODE:
         new_urls = list(found)[:TEST_LIMIT]
@@ -470,7 +505,7 @@ def main():
         new_urls = [u for u in found if u in labelled and u not in previous]
     print(f"{len(new_urls)} objective(s) to post")
 
-    new = [o for o in map(load_objective, new_urls) if o]
+    new = [o for o in (load_objective(u, found[u]["expires"]) for u in new_urls) if o]
     if new:
         embeds = [to_embed(o) for o in new]
         if DRY_RUN:
