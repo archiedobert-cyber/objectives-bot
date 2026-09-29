@@ -1,10 +1,14 @@
-"""Posts objectives labelled "New" on fut.gg/objectives to a Discord channel via webhook.
+"""Posts new objectives from fut.gg/objectives to a Discord channel via webhook.
+
+Any objective link not yet in posted.json counts as new. The very first run (no
+posted.json yet) just records everything currently listed WITHOUT posting, so
+only objectives added after that get posted.
 
 Env vars (same names as the SBC bot, so the same workflow file works):
   DISCORD_WEBHOOK_URL  webhook to post to (GitHub secret)
   PING_ROLE_ID         optional role ID to ping after the post (GitHub secret)
   DRY_RUN=1            print what would be posted instead of sending it
-  TEST_MODE=1          post every current "New" objective, even if already posted
+  TEST_MODE=1          post the first few objectives on the page, even if already posted
   TEST_URL=<link>      post just this one objective page, skipping the site scan
 """
 import json
@@ -40,8 +44,8 @@ HEADERS = {
 OBJ_HREF = re.compile(
     r"^(?:https://www\.fut\.gg)?/objectives/[a-z0-9-]+/\d+-[^/]+/?$"
 )
-# The badge must be exactly "New" (so a title like "Newcastle Special" won't match)
-NEW_BADGE = re.compile(r"^\s*new\s*$", re.I)
+# In test mode, how many objectives from the top of the page to post
+TEST_LIMIT = 3
 
 # Title line shown above the objective cards - edit the text/emojis however you like
 HEADER = "# 🚨🎯 **NEW OBJECTIVE ALERT** 🎯🚨"
@@ -333,7 +337,7 @@ def build_objective(url, page):
 
 
 def to_embed(obj):
-    head = f"## 🎯 {obj['title']}\n[More info]({obj['url']})"
+    head = f"## 🆕🎯 {obj['title']}\n[More info]({obj['url']})"
 
     rewards = ""
     if obj["rewards"]:
@@ -366,27 +370,23 @@ def to_embed(obj):
     return embed
 
 
-def find_new_objectives(html):
+def find_objective_links(html):
+    """Every objective link on the listing page, in page order."""
     soup = BeautifulSoup(html, "html.parser")
-    groups = {}
-    for a in soup.find_all("a", href=OBJ_HREF):
-        groups.setdefault(urljoin(BASE, a["href"]), []).append(a)
-
-    if not groups:
+    urls = list(dict.fromkeys(urljoin(BASE, a["href"]) for a in soup.find_all("a", href=OBJ_HREF)))
+    if not urls:
         sys.exit("No objective cards found - the page layout may have changed.")
-    print(f"Found {len(groups)} objectives on the page")
+    print(f"Found {len(urls)} objectives on the page")
+    return urls
 
-    new = []
-    for url, anchors in groups.items():
-        if not any(a.find(string=NEW_BADGE) for a in anchors):
-            continue
-        try:
-            page = BeautifulSoup(get(url), "html.parser")
-        except requests.RequestException as e:
-            print(f"Could not fetch objective page {url}: {e}")
-            continue
-        new.append(build_objective(url, page))
-    return new
+
+def load_objective(url):
+    try:
+        page = BeautifulSoup(get(url), "html.parser")
+    except requests.RequestException as e:
+        print(f"Could not fetch objective page {url}: {e}")
+        return None
+    return build_objective(url, page)
 
 
 def post(embeds):
@@ -422,9 +422,24 @@ def main():
             post([embed])
         return
 
-    posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
-    new = [o for o in find_new_objectives(get(LIST_URL)) if TEST_MODE or o["url"] not in posted]
-    print(f"{len(new)} new objective(s) to post" + (" (test mode)" if TEST_MODE else ""))
+    urls = find_objective_links(get(LIST_URL))
+
+    if TEST_MODE:
+        urls = urls[:TEST_LIMIT]
+        print(f"Test mode - posting the first {len(urls)} objectives")
+        posted = set()
+    elif not STATE_FILE.exists():
+        # First ever run: remember what's already there, post nothing.
+        print(f"First run - recording {len(urls)} existing objectives without posting")
+        if not DRY_RUN:
+            STATE_FILE.write_text(json.dumps(sorted(urls), indent=2))
+        return
+    else:
+        posted = set(json.loads(STATE_FILE.read_text()))
+
+    new_urls = [u for u in urls if u not in posted]
+    print(f"{len(new_urls)} new objective(s) to post")
+    new = [o for o in map(load_objective, new_urls) if o]
     if not new:
         return
 
@@ -434,7 +449,8 @@ def main():
         return
 
     post(embeds)
-    STATE_FILE.write_text(json.dumps(sorted(posted | {o["url"] for o in new}), indent=2))
+    if not TEST_MODE:
+        STATE_FILE.write_text(json.dumps(sorted(posted | {o["url"] for o in new}), indent=2))
 
 
 if __name__ == "__main__":
