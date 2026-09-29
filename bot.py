@@ -337,7 +337,7 @@ def build_objective(url, page):
 
 
 def to_embed(obj):
-    head = f"## 🆕🎯 {obj['title']}\n[More info]({obj['url']})"
+    head = f"## 🆕 {obj['title']}\n[More info]({obj['url']})"
 
     rewards = ""
     if obj["rewards"]:
