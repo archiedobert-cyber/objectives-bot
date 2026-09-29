@@ -1,9 +1,11 @@
 """Posts objectives labelled "New" on fut.gg/objectives to a Discord channel via webhook.
 
-Env vars:
+Env vars (same names as the SBC bot, so the same workflow file works):
   DISCORD_WEBHOOK_URL  webhook to post to (GitHub secret)
+  PING_ROLE_ID         optional role ID to ping after the post (GitHub secret)
   DRY_RUN=1            print what would be posted instead of sending it
   TEST_MODE=1          post every current "New" objective, even if already posted
+  TEST_URL=<link>      post just this one objective page, skipping the site scan
 """
 import json
 import os
@@ -11,17 +13,18 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 BASE = "https://www.fut.gg"
 LIST_URL = f"{BASE}/objectives/"
 STATE_FILE = Path("posted.json")  # remembers what's already been posted
 WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
-TEST_MODE = os.environ.get("TEST_MODE") == "1"  # post every current "New" objective, even if already posted
+TEST_MODE = os.environ.get("TEST_MODE") == "1"
+TEST_URL = os.environ.get("TEST_URL", "").strip()
 
 HEADERS = {
     "User-Agent": (
@@ -30,25 +33,29 @@ HEADERS = {
     )
 }
 
-# Links to individual objectives, e.g. /objectives/seasonal/72-weekly-rush-points/
-# (the numeric id stops tab pages like /objectives/expiring-soon/ from matching)
-OBJECTIVE_HREF = re.compile(
-    r"^(?:https://www\.fut\.gg)?/objectives/[a-z0-9-]+/\d+-[a-z0-9-]+/?$", re.I
+# Links to individual objectives, e.g.
+# /objectives/campaigns/113-squad-foundations-shunsuke-mito/
+# (the numeric id stops category pages like /objectives/expiring-soon/ matching)
+OBJ_HREF = re.compile(
+    r"^(?:https://www\.fut\.gg)?/objectives/[a-z0-9-]+/\d+-[^/]+/?$"
 )
 # The badge must be exactly "New" (so a title like "Newcastle Special" won't match)
 NEW_BADGE = re.compile(r"^\s*new\s*$", re.I)
-GENERIC_REWARD_LABELS = {"item"}  # placeholder label fut.gg shows for some rewards
 
 # Title line shown above the objective cards - edit the text/emojis however you like
-HEADER = "# 🎯🆕 **NEW OBJECTIVES ALERT** 🆕🎯\n-# 
+HEADER = "# 🚨🎯 **NEW OBJECTIVE ALERT** 🎯🚨"
 
-# Message posted at the very bottom, after all the objective cards.
-# Edit the text/emojis/link however you like, or set it to "" for no footer.
+# Message posted at the very bottom, after all the cards. "" = no footer.
 FOOTER = ""
 
-# Role to ping in the footer (pings once per post). Paste the role's ID - numbers
-# only, e.g. "123456789012345678" - or leave as "" for no ping.
-PING_ROLE_ID = "1551541765327167599"
+# Role to ping after the post. Set as a GitHub secret named PING_ROLE_ID
+# (numbers only) or paste the ID here. "" = no ping.
+PING_ROLE_ID = os.environ.get("PING_ROLE_ID", "").strip()
+
+# Show the task name in bold before each requirement, e.g.
+# "**Winners Circle:** Win 7 matches in any FUT game mode."
+# Set to False to show just the requirement text.
+SHOW_TASK_NAMES = True
 
 
 def get(url):
@@ -57,131 +64,226 @@ def get(url):
     return r.text
 
 
-def is_generic_image(src):
-    src = src.lower()
-    return any(
-        bit in src
-        for bit in ("fut-social", "favicon", "logo", "placeholder", "default-image", "sp.webp")
-    )
+IMAGE_ATTRS = (
+    "src",
+    "data-src",
+    "data-original",
+    "data-lazy-src",
+    "data-lazy",
+    "data-image",
+    "data-url",
+)
 
 
-def clean_image(src):
-    if not src or src.startswith("data:"):
-        return None
-    src = urljoin(BASE, src.strip())
-    return None if is_generic_image(src) else src
-
-
-def image_from_tag(img):
-    for attr in ("src", "data-src", "data-original", "data-lazy-src", "data-lazy"):
-        image = clean_image(img.get(attr))
-        if image:
-            return image
+def img_source(img):
+    """Best image URL an <img> tag carries (src, lazy-load attrs, srcset)."""
+    candidates = [img.get(a) for a in IMAGE_ATTRS]
     srcset = img.get("srcset") or img.get("data-srcset")
     if srcset:
         for item in srcset.split(","):
-            image = clean_image(item.strip().split()[0])
-            if image:
-                return image
+            parts = item.strip().split()
+            if parts:
+                candidates.append(parts[0])
+    for src in candidates:
+        if not src or src.startswith("data:"):
+            continue
+        src = urljoin(BASE, src.strip())
+        low = src.lower()
+        if any(g in low for g in ("fut-social", "favicon", "logo", "placeholder", "default-image")):
+            continue
+        return src
     return None
 
 
-def find_image(card, url):
-    """Objective image: first reward image on the card, else the page's social image."""
-    for img in card.find_all("img"):
-        image = image_from_tag(img)
-        if image:
-            return image
-
-    try:
-        page = BeautifulSoup(get(url), "html.parser")
-        for attrs in (
-            {"property": "og:image"},
-            {"name": "twitter:image"},
-        ):
-            meta = page.find("meta", attrs=attrs)
-            if meta:
-                image = clean_image(meta.get("content"))
-                if image:
-                    return image
-    except requests.RequestException as e:
-        print(f"Could not fetch objective page for image: {e}")
-    return None
+def bigger(src):
+    """fut.gg serves resized images (…/width=300/…); ask for a larger one."""
+    return re.sub(r"width=\d+", "width=600", src) if src else src
 
 
-def split_card_text(anchor):
-    """Card text -> (title, description, rewards). Card order: title, description, rewards."""
-    parts = [p for p in anchor.stripped_strings if not NEW_BADGE.match(p)]
-    if not parts:
-        return None, "", []
+NOISE = {"rewards", "reward", "award", "item", "pack", "total"}
 
-    title = parts[0]
-    rest = parts[1:]
 
-    description = ""
-    # Some objectives have no description - then the next line is already a reward
-    if rest and (re.search(r"[.!?]$", rest[0]) or len(rest[0]) > 60):
-        description = rest.pop(0)
+def is_noise(text):
+    low = text.lower()
+    return low in NOISE or bool(re.fullmatch(r"[\d,]+\s*total", low))
 
-    rewards, seen = [], set()
-    for line in rest:
-        key = line.lower()
-        if key in seen or key in GENERIC_REWARD_LABELS:
-            continue  # rewards show up twice (image label + text), keep one
-        seen.add(key)
-        rewards.append(line)
-    return title, description, rewards
+
+def clean_reward(text):
+    # "1x 4x 83+ Gold Players Pack" -> "4x 83+ Gold Players Pack"
+    return re.sub(r"^\d+x\s+(?=\d+x\b)", "", text, flags=re.I).strip()
+
+
+def is_player_link(tag):
+    return tag is not None and "/players/" in (tag.get("href") or "")
+
+
+def parse_objective(page):
+    """Walk the objective page top to bottom and pull out the tasks, the
+    rewards list and the reward image(s).
+
+    Page order: hero (overall reward) -> "Rewards" list -> one <h4> per task
+    followed by its requirement text.
+    """
+    root = page.find("main") or page.body or page
+    state = "hero"  # hero -> rewards -> tasks
+    hero_player = rewards_player = None
+    hero_texts, reward_lines, reward_imgs = [], [], []
+    tasks, current, desc_open = [], None, False
+
+    for el in root.descendants:
+        if el.find_parent(["script", "style", "nav", "header", "footer"]):
+            continue
+
+        if isinstance(el, Tag):
+            if el.name == "h4":
+                name = re.sub(r"\s+", " ", el.get_text(" ", strip=True))
+                if name.lower() == "rewards":  # in case the label is a heading
+                    state = "rewards"
+                    continue
+                state = "tasks"
+                current = {"name": name, "desc": []}
+                tasks.append(current)
+                desc_open = True
+            elif el.name == "img":
+                src = img_source(el)
+                if state == "tasks":
+                    desc_open = False  # the requirement text ends at the first icon
+                    continue
+                if is_player_link(el.find_parent("a")):
+                    player = {"name": (el.get("alt") or "").strip(), "image": src}
+                    if state == "rewards" and not rewards_player:
+                        rewards_player = player
+                    elif state == "hero" and not hero_player:
+                        hero_player = player
+                elif state == "rewards" and src:
+                    reward_imgs.append(src)
+            continue
+
+        if not isinstance(el, NavigableString) or el.find_parent("h4"):
+            continue
+        text = re.sub(r"\s+", " ", str(el)).strip()
+        if not text:
+            continue
+        if text.startswith("©"):
+            break
+
+        if state == "hero":
+            if text.lower() == "rewards":
+                state = "rewards"
+            else:
+                hero_texts.append(text)
+        elif state == "rewards":
+            if is_noise(text) or is_player_link(el.find_parent("a")):
+                continue
+            reward_lines.append(clean_reward(text))
+        elif current is not None and desc_open:
+            if is_noise(text) or re.match(r"^\d+x\b", text, re.I) or re.match(r"^[\d,]+\s*(sp|coins)\b", text, re.I):
+                desc_open = False
+            else:
+                current["desc"].append(text)
+
+    # Fallback if the page has no "Rewards" label: short reward-looking lines
+    # from the top of the page.
+    if not reward_lines:
+        for t in hero_texts:
+            if (
+                len(t) <= 60
+                and not t.endswith((".", "!"))
+                and not is_noise(t)
+                and re.search(r"\bSP\b|coins|pack|pick|token|boost|evo", t, re.I)
+            ):
+                reward_lines.append(clean_reward(t))
+
+    player = rewards_player or hero_player
+    rewards = list(dict.fromkeys(reward_lines))  # same line can appear twice
+
+    if player and player["name"]:
+        rewards = [r for r in rewards if r.lower() != player["name"].lower()]
+        rewards.insert(0, f"⭐ {player['name']}")  # overall reward always first
+
+    if player and player["image"]:
+        image, is_player = bigger(player["image"]), True
+    else:
+        non_sp = [i for i in reward_imgs if "sp.webp" not in i]
+        image = (non_sp or reward_imgs or [None])[0]
+        is_player = False
+
+    task_lines = []
+    for t in tasks:
+        desc = " ".join(t["desc"]).strip()
+        if desc and SHOW_TASK_NAMES:
+            task_lines.append(f"**{t['name']}:** {desc}")
+        else:
+            task_lines.append(desc or t["name"])
+
+    return {"tasks": task_lines, "rewards": rewards, "image": image, "is_player_reward": is_player}
+
+
+def find_title(page, url):
+    tag = page.find("h1") or page.find("title")
+    title = tag.get_text(" ", strip=True) if tag else url.rstrip("/").split("/")[-1]
+    return re.sub(r"\s*-\s*EA SPORTS FC.*$", "", title).strip()
+
+
+def build_objective(url, page):
+    data = parse_objective(page)
+    data.update({"url": url, "title": find_title(page, url)})
+    return data
+
+
+def to_embed(obj):
+    head = f"## 🎯 {obj['title']}\n[More info]({obj['url']})"
+
+    rewards = ""
+    if obj["rewards"]:
+        rewards = "\n## 💰 Rewards\n" + "\n".join(f"- {r}" for r in obj["rewards"])
+
+    tasks = ""
+    if obj["tasks"]:
+        budget = 4000 - len(head) - len(rewards) - 40  # Discord caps the description
+        lines, used = [], 0
+        for i, line in enumerate(obj["tasks"]):
+            used += len(line) + 3
+            if used > budget:
+                lines.append(f"…and {len(obj['tasks']) - i} more")
+                break
+            lines.append(f"- {line}")
+        tasks = "\n## 📋 Tasks\n" + "\n".join(lines)
+
+    embed = {"description": (head + tasks + rewards).strip()[:4000], "color": 0x3498DB}
+
+    if obj["image"]:
+        # Player rewards get the big full-width image at the bottom; anything
+        # else gets the smaller thumbnail slot.
+        key = "image" if obj["is_player_reward"] else "thumbnail"
+        embed[key] = {"url": obj["image"]}
+
+    print("DEBUG EMBED:")
+    print(json.dumps(embed, indent=2, ensure_ascii=False))
+    return embed
 
 
 def find_new_objectives(html):
     soup = BeautifulSoup(html, "html.parser")
-    anchors = {}
-    for a in soup.find_all("a", href=OBJECTIVE_HREF):
-        anchors.setdefault(urljoin(BASE, urlparse(a["href"]).path), a)
+    groups = {}
+    for a in soup.find_all("a", href=OBJ_HREF):
+        groups.setdefault(urljoin(BASE, a["href"]), []).append(a)
 
-    if not anchors:
+    if not groups:
         sys.exit("No objective cards found - the page layout may have changed.")
-    print(f"Found {len(anchors)} objectives on the page")
+    print(f"Found {len(groups)} objectives on the page")
 
     new = []
-    for url, a in anchors.items():
-        if not a.find(string=NEW_BADGE):
+    for url, anchors in groups.items():
+        if not any(a.find(string=NEW_BADGE) for a in anchors):
             continue
-
-        title, description, rewards = split_card_text(a)
-        if not title:
-            title = url.rstrip("/").split("/")[-1].split("-", 1)[-1].replace("-", " ").title()
-
-        new.append(
-            {
-                "url": url,
-                "title": title,
-                "description": description,
-                "rewards": rewards,
-                "image": find_image(a, url),
-            }
-        )
+        try:
+            page = BeautifulSoup(get(url), "html.parser")
+        except requests.RequestException as e:
+            print(f"Could not fetch objective page {url}: {e}")
+            continue
+        new.append(build_objective(url, page))
     return new
-
-
-def to_embed(obj):
-    description = f"## {obj['title']}"
-
-    if obj["description"]:
-        description += "\n\n" + obj["description"]
-
-    if obj["rewards"]:
-        description += "\n\n## 🎁 Rewards\n" + "\n".join(obj["rewards"])
-
-    embed = {
-        "title": obj["title"][:256],
-        "url": obj["url"],
-        "description": description.strip()[:4000],
-        "color": 0x2ECC71,
-    }
-    if obj["image"]:
-        embed["thumbnail"] = {"url": obj["image"]}
-    return embed
 
 
 def post(embeds):
@@ -206,6 +308,16 @@ def post(embeds):
 def main():
     if not WEBHOOK and not DRY_RUN:
         sys.exit("DISCORD_WEBHOOK_URL is not set")
+
+    if TEST_URL:
+        print(f"TEST_URL set - posting just this one objective: {TEST_URL}")
+        page = BeautifulSoup(get(TEST_URL), "html.parser")
+        embed = to_embed(build_objective(TEST_URL, page))
+        if DRY_RUN:
+            print(json.dumps([embed], indent=2, ensure_ascii=False))
+        else:
+            post([embed])
+        return
 
     posted = set(json.loads(STATE_FILE.read_text())) if STATE_FILE.exists() else set()
     new = [o for o in find_new_objectives(get(LIST_URL)) if TEST_MODE or o["url"] not in posted]
