@@ -352,7 +352,7 @@ def to_embed(obj):
 
     rewards = ""
     if obj["rewards"]:
-        rewards = "\n## 💰 Rewards\n" + "\n".join(f"- {r}" for r in obj["rewards"])
+        rewards = "\n## 🎁 Rewards\n" + "\n".join(f"- {r}" for r in obj["rewards"])
 
     expires = f"\n## ⏰ Expires In\n{obj['expires']}" if obj.get("expires") else ""
 
